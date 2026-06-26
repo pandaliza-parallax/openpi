@@ -19,7 +19,9 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.insertion_policy as insertion_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.standardbot_policy as standardbot_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -347,6 +349,100 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory()(model_config)
 
         # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotStandardbotDataConfig(DataConfigFactory):
+    """Data config for the StandardBots RO1 (single-arm, 6-DoF + gripper).
+
+    Mirrors ``LeRobotStandardbotDataConfig``'s LIBERO cousin. See
+    ``examples/standardbot/README.md`` for the end-to-end fine-tuning walkthrough and
+    ``src/openpi/policies/standardbot_policy.py`` for the state/action layout.
+    """
+
+    # If your actions are absolute joint targets, leave this True so the model trains on
+    # deltas (joints) with the gripper kept absolute. Set False if your data already stores
+    # delta actions.
+    use_delta_joint_actions: bool = True
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Remap the keys stored in the LeRobot dataset (left) to the keys the policy expects
+        # (right). These must match what the conversion script writes and what the inference
+        # environment sends to the policy server.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        # Applied during both training and inference.
+        data_transforms = _transforms.Group(
+            inputs=[standardbot_policy.StandardbotInputs(model_type=model_config.model_type)],
+            outputs=[standardbot_policy.StandardbotOutputs()],
+        )
+
+        # pi0/pi05 base models are trained on delta actions. The RO1's move_joints API takes
+        # absolute joint angles, so we convert the 6 joint dims to deltas and keep the gripper
+        # (last dim) absolute. Flip ``use_delta_joint_actions`` off if your data is already delta.
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        # Tokenization etc. No changes needed.
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotInsertionDataConfig(DataConfigFactory):
+    """Data config for the GS-sim peg-insertion teacher dataset (Parallax).
+
+    See ``src/openpi/policies/insertion_policy.py``. The actions are already task-space delta
+    setpoints, so NO extra delta transform is applied.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[insertion_policy.InsertionInputs(model_type=model_config.model_type)],
+            outputs=[insertion_policy.InsertionOutputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
@@ -760,6 +856,152 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    #
+    # Fine-tuning StandardBots RO1 config (Parallax). See examples/standardbot/README.md.
+    #
+    TrainConfig(
+        name="pi05_standardbot",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotStandardbotDataConfig(
+            # Point this at your converted LeRobot dataset (HF repo id or local repo id).
+            repo_id="parallax/standardbot",
+            # prompt_from_task pulls the language instruction from the LeRobot "task" field.
+            base_config=DataConfig(prompt_from_task=True),
+            # RO1 move_joints uses absolute joint targets -> train on deltas (gripper stays absolute).
+            use_delta_joint_actions=True,
+        ),
+        # Lower batch size to fit a single 32GB RTX 5090. Raise if you add GPUs / use LoRA.
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    #
+    # LoRA fine-tuning for the StandardBots RO1 (Parallax). Memory-light: fits a 32GB RTX 5090.
+    # LoRA (rank 16) is applied to the PaliGemma vision-language backbone ("gemma_2b_lora")
+    # *and* the action expert ("gemma_300m_lora"). LoRA-ing only the VL while freezing the
+    # action expert would leave the action head unable to adapt to the RO1 action space, so we
+    # adapt both. To full-train the action expert instead, set action_expert_variant="gemma_300m"
+    # in BOTH the model and freeze_filter below.
+    #
+    TrainConfig(
+        name="pi05_standardbot_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotStandardbotDataConfig(
+            repo_id="parallax/standardbot",
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=True,
+        ),
+        # LoRA trains far fewer params, so a larger batch fits than full fine-tuning.
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        # Freeze everything except the LoRA adapters. Must match the model variants above.
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        # EMA is turned off for LoRA fine-tuning.
+        ema_decay=None,
+    ),
+    #
+    # LoRA fine-tuning on the GS-sim peg-insertion teacher dataset (Parallax).
+    # 6-D task-space delta actions, 7-D pose state, single GS camera. Built to validate the
+    # SAC-teacher -> pi0.5 pipeline end-to-end (see gs-sim-vla/sample/).
+    #
+    TrainConfig(
+        name="pi05_insertion_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotInsertionDataConfig(
+            repo_id="parallax/sac_teacher_peg",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=5e-5,
+            decay_steps=10_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    #
+    # LoRA fine-tuning on the newton-cabling RJ45 insertion teacher (Parallax). Same I/O shape as
+    # pi05_insertion_lora (single image, 7-D plug pose, 6-D action); data from
+    # newton-cabling/rl/record_policy.py --dump -> raw_to_lerobot.py.
+    #
+    TrainConfig(
+        name="pi05_rj45_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotInsertionDataConfig(
+            repo_id="parallax/rj45_teacher",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        save_interval=250,   # checkpoint early/often so the eval harness can be tested sooner
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=5e-5,
+            decay_steps=10_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
     ),
     #
     # Fine-tuning Aloha configs.
