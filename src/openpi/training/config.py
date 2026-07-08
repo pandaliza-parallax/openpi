@@ -21,6 +21,7 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.insertion_policy as insertion_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.rj45_sbot_policy as rj45_sbot_policy
 import openpi.policies.standardbot_policy as standardbot_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -441,6 +442,42 @@ class LeRobotInsertionDataConfig(DataConfigFactory):
         data_transforms = _transforms.Group(
             inputs=[insertion_policy.InsertionInputs(model_type=model_config.model_type)],
             outputs=[insertion_policy.InsertionOutputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotRj45SbotDataConfig(DataConfigFactory):
+    """Data config for the sbot RJ45 full-episode GS dataset (Parallax).
+
+    See ``src/openpi/policies/rj45_sbot_policy.py``. Two cameras (front + wrist), 10-D EEF
+    pose state, 7-D actions that are ALREADY base-frame deltas -> no extra delta transform.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[rj45_sbot_policy.Rj45SbotInputs(model_type=model_config.model_type)],
+            outputs=[rj45_sbot_policy.Rj45SbotOutputs()],
         )
         model_transforms = ModelTransformFactory()(model_config)
         return dataclasses.replace(
@@ -994,6 +1031,45 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=10_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    #
+    # LoRA fine-tuning on the sbot RJ45 FULL-EPISODE GS dataset (Parallax): front + wrist cams,
+    # 10-D EEF pose state, 7-D delta actions with a live gripper channel, 257-frame episodes
+    # (home hold -> approach/grasp -> insertion). Data: newton-cabling/tools/render_batch.sh ->
+    # tools/datagen_to_lerobot.py -> repo parallax/rj45_sbot.
+    #
+    TrainConfig(
+        name="pi05_rj45_sbot_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRj45SbotDataConfig(
+            repo_id="parallax/rj45_sbot",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        save_interval=500,
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=5e-5,
+            decay_steps=15_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
             action_horizon=10,
