@@ -1056,7 +1056,7 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotRj45SbotDataConfig(
-            repo_id="parallax/rj45_sbot",
+            repo_id="Parallax-Worlds/rj45_sbot_difix",
             base_config=DataConfig(prompt_from_task=True),
         ),
         save_interval=500,
